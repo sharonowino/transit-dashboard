@@ -14,6 +14,7 @@ pytz==2023.3
 fastapi
 uvicorn
 pydantic
+matplotlib
 pydeck>=0.8.0
 xgboost>=2.0.0
 shap>=0.42.0
