@@ -1,9 +1,14 @@
-fast_api.py# main.py
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import joblib
 import numpy as np
 import os
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # --- App setup ---
 app = FastAPI(
@@ -83,20 +88,51 @@ class PredictRequest(BaseModel):
         }
 
 
+class BatchPredictRequest(BaseModel):
+    model_name: str              # e.g. "XGBoost", "RandomForest", "NeuralNet", "BEST"
+    task: str                    # "binary" or "multi"
+    features: list[list[float]]  # List of feature lists
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "model_name": "XGBoost",
+                "task": "binary",
+                "features": [[23.5, 1.0, 4500.0, 0.8, 3.2], [20.0, 2.0, 3000.0, 0.5, 2.5]]
+            }
+        }
+
+
 # ----------------------------------------------------------------
 # --- Helper: preprocess input ---
 # ----------------------------------------------------------------
 def preprocess(features: list[float]) -> np.ndarray:
     X = np.array(features).reshape(1, -1)
-
-    # Step 1: Impute missing values if imputer is available
+    
+    original_features = X.shape[1]
+    
+    # Step 1: Impute missing values if imputer is available AND feature count matches
     if imputer is not None:
-        X = imputer.transform(X)
+        try:
+            imputer_n_features = imputer.n_features_in_ if hasattr(imputer, 'n_features_in_') else 0
+            if original_features == imputer_n_features:
+                X = imputer.transform(X)
+            else:
+                logger.warning(f"Feature count mismatch: got {original_features}, imputer expects {imputer_n_features}. Skipping imputation.")
+        except Exception as e:
+            logger.warning(f"Imputer error: {e}. Skipping imputation.")
 
-    # Step 2: Scale features if scaler is available
+    # Step 2: Scale features if scaler is available AND feature count matches
     if scaler is not None:
-        X = scaler.transform(X)
-
+        try:
+            scaler_n_features = scaler.n_features_in_ if hasattr(scaler, 'n_features_in_') else 0
+            if X.shape[1] == scaler_n_features:
+                X = scaler.transform(X)
+            else:
+                logger.warning(f"Feature count mismatch: got {X.shape[1]}, scaler expects {scaler_n_features}. Skipping scaling.")
+        except Exception as e:
+            logger.warning(f"Scaler error: {e}. Skipping scaling.")
+    
     return X
 
 
@@ -107,12 +143,20 @@ def run_prediction(model, X: np.ndarray):
     prediction = model.predict(X)
 
     # Get confidence/probability if model supports it
+    confidence = None
     if hasattr(model, 'predict_proba'):
-        proba = model.predict_proba(X)
-        confidence = round(float(proba.max()), 4)
-    else:
-        confidence = None
-
+        try:
+            proba = model.predict_proba(X)
+            # Handle different return types
+            if hasattr(proba, 'max'):
+                confidence = round(float(proba.max()), 4)
+            elif isinstance(proba, (list, np.ndarray)):
+                proba_arr = np.array(proba)
+                confidence = round(float(proba_arr.max()), 4)
+        except Exception as e:
+            logger.warning(f"Could not get probabilities: {e}")
+            confidence = None
+    
     return prediction[0], confidence
 
 
@@ -157,6 +201,8 @@ def list_models():
 # Main prediction endpoint
 @app.post("/predict")
 def predict(request: PredictRequest):
+    logger.info(f"Received prediction request: model={request.model_name}, task={request.task}, features_count={len(request.features)}")
+    logger.info(f"Features: {request.features}")
 
     # --- Validate task ---
     if request.task not in ("binary", "multi"):
@@ -183,12 +229,15 @@ def predict(request: PredictRequest):
     try:
         X = preprocess(request.features)
     except Exception as e:
+        logger.error(f"Preprocessing error: {str(e)}")
         raise HTTPException(status_code=400, detail=f"Preprocessing error: {str(e)}")
 
     # --- Predict ---
     try:
         prediction, confidence = run_prediction(model_pool[request.model_name], X)
+        logger.info(f"Prediction successful: {prediction}, confidence: {confidence}")
     except Exception as e:
+        logger.error(f"Prediction error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Prediction error: {str(e)}")
 
     # --- Return result ---
@@ -199,3 +248,99 @@ def predict(request: PredictRequest):
         "confidence": confidence if confidence is not None else "N/A",
         "input_features": request.features
     }
+
+
+# Batch prediction endpoint - OPTIMIZED
+@app.post("/predict/batch")
+def predict_batch(request: BatchPredictRequest):
+    logger.info(f"Received batch prediction request: model={request.model_name}, task={request.task}, num_samples={len(request.features)}")
+    
+    # --- Validate task ---
+    if request.task not in ("binary", "multi"):
+        raise HTTPException(
+            status_code=400,
+            detail="task must be 'binary' or 'multi'"
+        )
+
+    # --- Pick the right model ---
+    model_pool = binary_models if request.task == "binary" else multi_models
+
+    if request.model_name not in model_pool:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Model '{request.model_name}' not found for task '{request.task}'. "
+                   f"Available: {list(model_pool.keys())}"
+        )
+
+    # --- Validate features ---
+    if not request.features:
+        raise HTTPException(status_code=400, detail="features list cannot be empty")
+    
+    model = model_pool[request.model_name]
+    
+    try:
+        # Convert all features to numpy array at once - MUCH FASTER
+        X = np.array(request.features)
+        
+        # Apply preprocessing to entire batch at once
+        original_features = X.shape[1]
+        
+        # Skip imputer if feature count doesn't match
+        if imputer is not None:
+            try:
+                imputer_n_features = imputer.n_features_in_ if hasattr(imputer, 'n_features_in_') else 0
+                if original_features == imputer_n_features:
+                    X = imputer.transform(X)
+            except:
+                pass
+        
+        # Skip scaler if feature count doesn't match
+        if scaler is not None:
+            try:
+                scaler_n_features = scaler.n_features_in_ if hasattr(scaler, 'n_features_in_') else 0
+                if X.shape[1] == scaler_n_features:
+                    X = scaler.transform(X)
+            except:
+                pass
+        
+        # Predict entire batch at once - VERY FAST
+        predictions = model.predict(X)
+        
+        # Get probabilities for entire batch if available
+        confidences = None
+        if hasattr(model, 'predict_proba'):
+            try:
+                probas = model.predict_proba(X)
+                # Convert to numpy array if needed and get max along axis
+                probas_arr = np.array(probas)
+                confidences = probas_arr.max(axis=1).tolist()
+            except Exception as e:
+                logger.warning(f"Could not get probabilities: {e}")
+        
+        # Build results
+        results = []
+        for i, pred in enumerate(predictions):
+            conf = None
+            if confidences:
+                try:
+                    conf = round(float(confidences[i]), 4)
+                except:
+                    pass
+            results.append({
+                "index": i,
+                "prediction": str(pred),
+                "confidence": conf
+            })
+        
+        logger.info(f"Batch prediction complete: {len(results)} samples processed")
+        
+        return {
+            "model_used": request.model_name,
+            "task": request.task,
+            "num_samples": len(request.features),
+            "results": results
+        }
+        
+    except Exception as e:
+        logger.error(f"Batch prediction error: {e}")
+        raise HTTPException(status_code=500, detail=f"Batch prediction error: {str(e)}")

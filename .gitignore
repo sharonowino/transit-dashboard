@@ -39,13 +39,9 @@ env/
 
 # Data files
 *.csv
-*.parquet
-*.pkl
-*.pickle
 *.zip
 
 # Models
-*.pkl
 *.joblib
 *.h5
 *.pt
